@@ -72,11 +72,7 @@ impl SlackClient {
 
     pub(crate) async fn conversation_info(&self, channel_id: &str) -> Result<SlackConversation> {
         let value = self
-            .call(
-                Method::POST,
-                "conversations.info",
-                Some(json!({ "channel": channel_id })),
-            )
+            .call_read("conversations.info", &[("channel", channel_id)])
             .await?;
         serde_json::from_value(
             value
@@ -88,9 +84,7 @@ impl SlackClient {
     }
 
     pub(crate) async fn user_display_name(&self, user_id: &str) -> Result<String> {
-        let value = self
-            .call(Method::POST, "users.info", Some(json!({ "user": user_id })))
-            .await?;
+        let value = self.call_read("users.info", &[("user", user_id)]).await?;
         let user = value
             .get("user")
             .context("Slack users.info response omitted user")?;
@@ -137,14 +131,33 @@ impl SlackClient {
         })
     }
 
+    /// Slack's read methods (`conversations.info`, `users.info`) reject JSON
+    /// bodies with `invalid_arguments`; they take query/form parameters. Write
+    /// methods such as `chat.postMessage` take JSON.
+    async fn call_read(&self, endpoint: &str, query: &[(&str, &str)]) -> Result<Value> {
+        self.send(Method::GET, endpoint, None, query).await
+    }
+
     async fn call(&self, method: Method, endpoint: &str, payload: Option<Value>) -> Result<Value> {
-        let url = format!("{}/{endpoint}", self.api_origin);
+        self.send(method, endpoint, payload, &[]).await
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        endpoint: &str,
+        payload: Option<Value>,
+        query: &[(&str, &str)],
+    ) -> Result<Value> {
+        let url =
+            reqwest::Url::parse_with_params(&format!("{}/{endpoint}", self.api_origin), query)
+                .with_context(|| format!("invalid Slack {endpoint} URL"))?;
         let mut last_error = None;
 
         for attempt in 0..MAX_API_ATTEMPTS {
             let mut request = self
                 .http
-                .request(method.clone(), &url)
+                .request(method.clone(), url.clone())
                 .bearer_auth(&self.bot_token);
             if let Some(payload) = &payload {
                 request = request.json(payload);
@@ -238,5 +251,55 @@ mod tests {
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(truncated.chars().count() <= MAX_SLACK_TEXT_CHARS);
         assert!(truncated.ends_with("… _(truncated)_"));
+    }
+
+    /// Fake Slack read endpoint that behaves like the real one: arguments must
+    /// arrive as query/form parameters; a JSON body gets `invalid_arguments`.
+    async fn fake_slack_read(
+        axum::extract::Query(params): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >,
+        headers: axum::http::HeaderMap,
+    ) -> axum::Json<Value> {
+        let json_body = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+        if json_body || !(params.contains_key("channel") || params.contains_key("user")) {
+            return axum::Json(json!({ "ok": false, "error": "invalid_arguments" }));
+        }
+        axum::Json(json!({
+            "ok": true,
+            "channel": { "is_private": true, "name": "buzz-bridge-test" },
+            "user": { "name": "ram", "profile": { "display_name": "Ram" } }
+        }))
+    }
+
+    async fn fake_slack() -> SlackClient {
+        let app = axum::Router::new()
+            .route("/conversations.info", axum::routing::any(fake_slack_read))
+            .route("/users.info", axum::routing::any(fake_slack_read));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut client = SlackClient::new("xoxb-test".to_owned()).unwrap();
+        client.api_origin = origin;
+        client
+    }
+
+    #[tokio::test]
+    async fn conversation_info_sends_arguments_slack_accepts() {
+        let info = fake_slack()
+            .await
+            .conversation_info("C0C5B8Q1A1L")
+            .await
+            .unwrap();
+        assert!(info.is_private);
+        assert_eq!(info.name, "buzz-bridge-test");
+    }
+
+    #[tokio::test]
+    async fn user_display_name_sends_arguments_slack_accepts() {
+        let name = fake_slack().await.user_display_name("U123").await.unwrap();
+        assert_eq!(name, "Ram");
     }
 }
