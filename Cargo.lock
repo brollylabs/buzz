@@ -1544,7 +1544,7 @@ dependencies = [
  "buzz-ws-client",
  "hex",
  "hmac 0.13.0",
- "nostr",
+ "nostr 0.44.7",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
