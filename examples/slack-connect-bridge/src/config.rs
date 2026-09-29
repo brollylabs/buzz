@@ -15,6 +15,8 @@ use uuid::Uuid;
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:3100";
 const DEFAULT_REPLAY_LOOKBACK_SECS: u64 = 86_400;
 const MAX_REPLAY_LOOKBACK_SECS: u64 = 30 * 86_400;
+const DEFAULT_DISPLAY_NAME: &str = "Slack Connect Bridge";
+const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
 /// One explicit Slack channel to Buzz channel route.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -36,7 +38,14 @@ struct FileConfig {
     allow_non_shared_channels: bool,
     #[serde(default = "default_replay_lookback_secs")]
     replay_lookback_secs: u64,
+    /// Name the bridge's Buzz profile shows on bridged messages.
+    #[serde(default = "default_display_name")]
+    display_name: String,
     channels: Vec<ChannelMapping>,
+}
+
+fn default_display_name() -> String {
+    DEFAULT_DISPLAY_NAME.to_owned()
 }
 
 fn default_listen_addr() -> String {
@@ -62,6 +71,7 @@ pub(crate) struct Config {
     pub(crate) state_path: PathBuf,
     pub(crate) allow_non_shared_channels: bool,
     pub(crate) replay_lookback_secs: u64,
+    pub(crate) display_name: String,
     pub(crate) channels: Vec<ChannelMapping>,
 }
 
@@ -95,6 +105,7 @@ impl Config {
             state_path,
             allow_non_shared_channels: file.allow_non_shared_channels,
             replay_lookback_secs: file.replay_lookback_secs,
+            display_name: file.display_name.trim().to_owned(),
             channels: file.channels,
         })
     }
@@ -128,6 +139,10 @@ fn validate_file_config(config: &FileConfig) -> Result<()> {
     }
     if config.replay_lookback_secs == 0 || config.replay_lookback_secs > MAX_REPLAY_LOOKBACK_SECS {
         bail!("replay_lookback_secs must be between 1 and {MAX_REPLAY_LOOKBACK_SECS}");
+    }
+    let display_name = config.display_name.trim();
+    if display_name.is_empty() || display_name.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        bail!("display_name must be 1 to {MAX_DISPLAY_NAME_CHARS} characters");
     }
 
     let mut slack_routes = HashSet::new();
@@ -183,12 +198,31 @@ mod tests {
             state_path: default_state_path(),
             allow_non_shared_channels: false,
             replay_lookback_secs: DEFAULT_REPLAY_LOOKBACK_SECS,
+            display_name: default_display_name(),
             channels: vec![ChannelMapping {
                 slack_team_id: "T12345678".into(),
                 slack_channel_id: "C12345678".into(),
                 buzz_channel_id: Uuid::new_v4(),
             }],
         }
+    }
+
+    #[test]
+    fn display_name_defaults_and_can_be_overridden() {
+        let file: FileConfig = serde_json::from_str(r#"{"channels":[]}"#).unwrap();
+        assert_eq!(file.display_name, "Slack Connect Bridge");
+        let file: FileConfig =
+            serde_json::from_str(r#"{"display_name":"Slack","channels":[]}"#).unwrap();
+        assert_eq!(file.display_name, "Slack");
+    }
+
+    #[test]
+    fn rejects_blank_or_overlong_display_name() {
+        let mut config = file_config();
+        config.display_name = "   ".into();
+        assert!(validate_file_config(&config).is_err());
+        config.display_name = "x".repeat(65);
+        assert!(validate_file_config(&config).is_err());
     }
 
     #[test]

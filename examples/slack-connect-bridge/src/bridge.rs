@@ -25,7 +25,6 @@ use crate::{
 
 const SUBSCRIPTION_ID: &str = "slack-connect-bridge";
 const BRIDGE_NAME: &str = "slack-connect-bridge";
-const BRIDGE_DISPLAY_NAME: &str = "Slack Connect Bridge";
 const BRIDGE_ABOUT: &str =
     "Bridges explicitly mapped Buzz channels and Slack Connect channels without impersonating users.";
 const BRIDGE_ICON_DATA_URL: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='28' fill='%23131622'/%3E%3Cpath d='M36 64h56M64 36v56' stroke='%237dd3fc' stroke-width='13' stroke-linecap='round'/%3E%3Ccircle cx='36' cy='64' r='13' fill='%23facc15'/%3E%3Ccircle cx='92' cy='64' r='13' fill='%23a78bfa'/%3E%3C/svg%3E";
@@ -234,7 +233,7 @@ impl Bridge {
 
     async fn publish_bridge_profile(&self, connection: &mut NostrWsConnection) -> Result<()> {
         let event = buzz_sdk::build_profile(
-            Some(BRIDGE_DISPLAY_NAME),
+            Some(self.config.display_name.as_str()),
             Some(BRIDGE_NAME),
             Some(BRIDGE_ICON_DATA_URL),
             Some(BRIDGE_ABOUT),
@@ -937,6 +936,7 @@ mod tests {
             state_path: "state.json".into(),
             allow_non_shared_channels: false,
             replay_lookback_secs: 60,
+            display_name: "Slack Connect Bridge".to_owned(),
             channels: vec![ChannelMapping {
                 slack_team_id: "T12345678".into(),
                 slack_channel_id: "C12345678".into(),
