@@ -2,6 +2,7 @@
 //! Operator-run reference bridge between Buzz channels and Slack Connect.
 
 mod bridge;
+mod buzz_media;
 mod config;
 mod media;
 mod slack;
