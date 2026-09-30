@@ -34,6 +34,13 @@ pub(crate) struct SlackConversation {
     pub(crate) name: String,
 }
 
+/// One file to upload to Slack.
+pub(crate) struct UploadFile {
+    pub(crate) name: String,
+    pub(crate) mime: String,
+    pub(crate) body: bytes::Bytes,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct SlackPostedMessage {
     pub(crate) ts: String,
@@ -131,6 +138,96 @@ impl SlackClient {
         })
     }
 
+    pub(crate) async fn download_file(
+        &self,
+        url: &str,
+        mime: &str,
+        cap: u64,
+    ) -> Result<bytes::Bytes, crate::media::CopyFailure> {
+        use crate::media::{read_capped, slack_download_allowed, transfer_timeout, CopyFailure};
+        if !slack_download_allowed(url) {
+            return Err(CopyFailure::NotAllowed);
+        }
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.bot_token)
+            .timeout(transfer_timeout(mime))
+            .send()
+            .await
+            .map_err(|_| CopyFailure::Failed)?;
+        read_capped(response, cap).await
+    }
+
+    /// Upload files, share them into the channel (and thread) with `comment`,
+    /// and return the resulting message ts if Slack reports it within ~10 s.
+    /// Callers pass at least one file.
+    pub(crate) async fn upload_files(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        comment: &str,
+        files: Vec<UploadFile>,
+    ) -> Result<Option<String>> {
+        let mut ids = Vec::new();
+        for file in files {
+            let length = file.body.len().to_string();
+            let value = self
+                .send(
+                    Method::GET,
+                    "files.getUploadURLExternal",
+                    None,
+                    &[
+                        ("filename", file.name.as_str()),
+                        ("length", length.as_str()),
+                    ],
+                )
+                .await?;
+            let upload_url = required_string(&value, "upload_url", "files.getUploadURLExternal")?;
+            let file_id = required_string(&value, "file_id", "files.getUploadURLExternal")?;
+            let response = self
+                .http
+                .post(&upload_url)
+                .timeout(crate::media::transfer_timeout(&file.mime))
+                .body(file.body)
+                .send()
+                .await
+                .context("Slack file upload request failed")?;
+            if !response.status().is_success() {
+                bail!("Slack file upload returned HTTP {}", response.status());
+            }
+            ids.push(json!({ "id": file_id, "title": file.name }));
+        }
+        let first_id = ids
+            .first()
+            .and_then(|file| file["id"].as_str())
+            .context("upload_files called without files")?
+            .to_owned();
+        let files_json = Value::Array(ids).to_string();
+        let mut query: Vec<(&str, &str)> = vec![
+            ("files", files_json.as_str()),
+            ("channel_id", channel_id),
+            ("initial_comment", comment),
+        ];
+        if let Some(thread_ts) = thread_ts {
+            query.push(("thread_ts", thread_ts));
+        }
+        self.send(Method::POST, "files.completeUploadExternal", None, &query)
+            .await?;
+
+        // Slack shares uploaded files asynchronously; look the message ts up briefly.
+        for _ in 0..10 {
+            let info = self
+                .call_read("files.info", &[("file", first_id.as_str())])
+                .await?;
+            if let Some(ts) = share_ts(&info, channel_id) {
+                return Ok(Some(ts));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Ok(None)
+    }
+
     /// Slack's read methods (`conversations.info`, `users.info`) reject JSON
     /// bodies with `invalid_arguments`; they take query/form parameters. Write
     /// methods such as `chat.postMessage` take JSON.
@@ -215,6 +312,20 @@ impl SlackClient {
     }
 }
 
+fn share_ts(info: &Value, channel_id: &str) -> Option<String> {
+    let shares = info.get("file")?.get("shares")?;
+    ["private", "public"].iter().find_map(|kind| {
+        shares
+            .get(kind)?
+            .get(channel_id)?
+            .as_array()?
+            .first()?
+            .get("ts")?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
 fn required_string(value: &Value, field: &str, endpoint: &str) -> Result<String> {
     value
         .get(field)
@@ -295,6 +406,105 @@ mod tests {
             .unwrap();
         assert!(info.is_private);
         assert_eq!(info.name, "buzz-bridge-test");
+    }
+
+    #[tokio::test]
+    async fn download_file_refuses_other_hosts() {
+        let client = SlackClient::new("xoxb-test".to_owned()).unwrap();
+        assert_eq!(
+            client
+                .download_file("https://evil.example/x.png", "image/png", 10)
+                .await,
+            Err(crate::media::CopyFailure::NotAllowed)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_files_runs_the_external_upload_flow_and_finds_the_ts() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        type Calls = Arc<Mutex<Vec<String>>>;
+        #[derive(Clone)]
+        struct Fake {
+            calls: Calls,
+            origin: Arc<Mutex<String>>,
+        }
+        async fn get_url(
+            axum::extract::State(f): axum::extract::State<Fake>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::Json<Value> {
+            f.calls
+                .lock()
+                .unwrap()
+                .push(format!("get:{}:{}", q["filename"], q["length"]));
+            let origin = f.origin.lock().unwrap().clone();
+            axum::Json(json!({"ok": true, "upload_url": format!("{origin}/put"), "file_id": "F9"}))
+        }
+        async fn put_bytes(
+            axum::extract::State(f): axum::extract::State<Fake>,
+            body: axum::body::Bytes,
+        ) -> &'static str {
+            f.calls.lock().unwrap().push(format!("put:{}", body.len()));
+            "OK"
+        }
+        async fn complete(
+            axum::extract::State(f): axum::extract::State<Fake>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::Json<Value> {
+            f.calls.lock().unwrap().push(format!(
+                "complete:{}:{}:{}",
+                q["channel_id"],
+                q.get("thread_ts").cloned().unwrap_or_default(),
+                q["initial_comment"]
+            ));
+            axum::Json(json!({"ok": true, "files": [{"id": "F9"}]}))
+        }
+        async fn info(axum::extract::State(f): axum::extract::State<Fake>) -> axum::Json<Value> {
+            f.calls.lock().unwrap().push("info".into());
+            axum::Json(
+                json!({"ok": true, "file": {"shares": {"private": {"C1": [{"ts": "1790000000.000200"}]}}}}),
+            )
+        }
+        let fake = Fake {
+            calls: Arc::default(),
+            origin: Arc::default(),
+        };
+        let app = axum::Router::new()
+            .route("/files.getUploadURLExternal", axum::routing::any(get_url))
+            .route("/put", axum::routing::post(put_bytes))
+            .route(
+                "/files.completeUploadExternal",
+                axum::routing::any(complete),
+            )
+            .route("/files.info", axum::routing::any(info))
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        *fake.origin.lock().unwrap() = origin.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut client = SlackClient::new("xoxb-test".to_owned()).unwrap();
+        client.api_origin = origin;
+
+        let ts = client
+            .upload_files(
+                "C1",
+                Some("1790000000.000100"),
+                "*ram · Buzz*\nhi",
+                vec![UploadFile {
+                    name: "a.png".into(),
+                    mime: "image/png".into(),
+                    body: bytes::Bytes::from_static(b"abc"),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ts.as_deref(), Some("1790000000.000200"));
+        let calls = fake.calls.lock().unwrap().clone();
+        assert_eq!(calls[0], "get:a.png:3");
+        assert_eq!(calls[1], "put:3");
+        assert_eq!(calls[2], "complete:C1:1790000000.000100:*ram · Buzz*\nhi");
+        assert_eq!(calls[3], "info");
     }
 
     #[tokio::test]
