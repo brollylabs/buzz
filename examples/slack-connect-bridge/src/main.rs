@@ -3,6 +3,7 @@
 
 mod bridge;
 mod config;
+mod media;
 mod slack;
 mod state;
 

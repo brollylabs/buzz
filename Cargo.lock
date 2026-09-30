@@ -1542,6 +1542,8 @@ dependencies = [
  "axum",
  "buzz-sdk",
  "buzz-ws-client",
+ "bytes",
+ "futures-util",
  "hex",
  "hmac 0.13.0",
  "nostr 0.44.7",
