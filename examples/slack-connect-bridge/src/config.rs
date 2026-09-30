@@ -17,6 +17,7 @@ const DEFAULT_REPLAY_LOOKBACK_SECS: u64 = 86_400;
 const MAX_REPLAY_LOOKBACK_SECS: u64 = 30 * 86_400;
 const DEFAULT_DISPLAY_NAME: &str = "Slack Connect Bridge";
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
+const DEFAULT_MAX_FILE_BYTES: u64 = 104_857_600;
 
 /// One explicit Slack channel to Buzz channel route.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -41,7 +42,14 @@ struct FileConfig {
     /// Name the bridge's Buzz profile shows on bridged messages.
     #[serde(default = "default_display_name")]
     display_name: String,
+    /// Largest file (bytes) the bridge copies; larger ones become a link line.
+    #[serde(default = "default_max_file_bytes")]
+    max_file_bytes: u64,
     channels: Vec<ChannelMapping>,
+}
+
+fn default_max_file_bytes() -> u64 {
+    DEFAULT_MAX_FILE_BYTES
 }
 
 fn default_display_name() -> String {
@@ -72,6 +80,7 @@ pub(crate) struct Config {
     pub(crate) allow_non_shared_channels: bool,
     pub(crate) replay_lookback_secs: u64,
     pub(crate) display_name: String,
+    pub(crate) max_file_bytes: u64,
     pub(crate) channels: Vec<ChannelMapping>,
 }
 
@@ -106,6 +115,7 @@ impl Config {
             allow_non_shared_channels: file.allow_non_shared_channels,
             replay_lookback_secs: file.replay_lookback_secs,
             display_name: file.display_name.trim().to_owned(),
+            max_file_bytes: file.max_file_bytes,
             channels: file.channels,
         })
     }
@@ -143,6 +153,9 @@ fn validate_file_config(config: &FileConfig) -> Result<()> {
     let display_name = config.display_name.trim();
     if display_name.is_empty() || display_name.chars().count() > MAX_DISPLAY_NAME_CHARS {
         bail!("display_name must be 1 to {MAX_DISPLAY_NAME_CHARS} characters");
+    }
+    if config.max_file_bytes == 0 || config.max_file_bytes > DEFAULT_MAX_FILE_BYTES {
+        bail!("max_file_bytes must be between 1 and {DEFAULT_MAX_FILE_BYTES}");
     }
 
     let mut slack_routes = HashSet::new();
@@ -199,12 +212,30 @@ mod tests {
             allow_non_shared_channels: false,
             replay_lookback_secs: DEFAULT_REPLAY_LOOKBACK_SECS,
             display_name: default_display_name(),
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             channels: vec![ChannelMapping {
                 slack_team_id: "T12345678".into(),
                 slack_channel_id: "C12345678".into(),
                 buzz_channel_id: Uuid::new_v4(),
             }],
         }
+    }
+
+    #[test]
+    fn max_file_bytes_defaults_to_100_mb() {
+        let file: FileConfig = serde_json::from_str(r#"{"channels":[]}"#).unwrap();
+        assert_eq!(file.max_file_bytes, 104_857_600);
+    }
+
+    #[test]
+    fn rejects_max_file_bytes_out_of_range() {
+        let mut config = file_config();
+        config.max_file_bytes = 0;
+        assert!(validate_file_config(&config).is_err());
+        config.max_file_bytes = 104_857_601;
+        assert!(validate_file_config(&config).is_err());
+        config.max_file_bytes = 10;
+        assert!(validate_file_config(&config).is_ok());
     }
 
     #[test]

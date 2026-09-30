@@ -937,6 +937,7 @@ mod tests {
             allow_non_shared_channels: false,
             replay_lookback_secs: 60,
             display_name: "Slack Connect Bridge".to_owned(),
+            max_file_bytes: 104_857_600,
             channels: vec![ChannelMapping {
                 slack_team_id: "T12345678".into(),
                 slack_channel_id: "C12345678".into(),
