@@ -44,6 +44,10 @@ struct PersistedState {
     last_buzz_created_at: Option<u64>,
     #[serde(default)]
     slack_user_names: BTreeMap<String, String>,
+    /// Buzz events delivered to Slack whose Slack message ts was never learned
+    /// (file shares). Recorded so a relay replay does not deliver them again.
+    #[serde(default)]
+    delivered_without_ts: BTreeSet<String>,
 }
 
 impl Default for PersistedState {
@@ -56,6 +60,7 @@ impl Default for PersistedState {
             paused_buzz_channels: BTreeSet::new(),
             last_buzz_created_at: None,
             slack_user_names: BTreeMap::new(),
+            delivered_without_ts: BTreeSet::new(),
         }
     }
 }
@@ -117,6 +122,19 @@ impl StateStore {
             next.slack_to_buzz
                 .insert(slack_key(buzz_channel_id, &slack_ts), event_id.clone());
             next.buzz_to_slack.insert(event_id, slack);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn was_delivered(&self, buzz_event_id: &str) -> bool {
+        self.data.buzz_to_slack.contains_key(buzz_event_id)
+            || self.data.delivered_without_ts.contains(buzz_event_id)
+    }
+
+    pub(crate) fn record_delivered_without_ts(&mut self, buzz_event_id: &str) -> Result<()> {
+        let event_id = buzz_event_id.to_owned();
+        self.commit(move |next| {
+            next.delivered_without_ts.insert(event_id);
             Ok(())
         })
     }
@@ -342,6 +360,18 @@ mod tests {
             reloaded.slack_message_for_buzz(&"a".repeat(64)),
             Some(&slack)
         );
+    }
+
+    #[test]
+    fn delivered_without_ts_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = StateStore::load(path.clone()).unwrap();
+        assert!(!store.was_delivered("e1"));
+        store.record_delivered_without_ts("e1").unwrap();
+        let store = StateStore::load(path).unwrap();
+        assert!(store.was_delivered("e1"));
+        assert!(!store.was_delivered("e2"));
     }
 
     #[test]

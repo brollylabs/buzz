@@ -104,13 +104,14 @@ pub(crate) struct BlobDescriptor {
 }
 
 /// NIP-92 `imeta` tag, identical in shape to buzz-cli's `build_imeta_tag`.
-pub(crate) fn imeta_tag(desc: &BlobDescriptor) -> Vec<String> {
+pub(crate) fn imeta_tag(desc: &BlobDescriptor, filename: &str) -> Vec<String> {
     let mut tag = vec![
         "imeta".to_owned(),
         format!("url {}", desc.url),
         format!("m {}", desc.mime_type),
         format!("x {}", desc.sha256),
         format!("size {}", desc.size),
+        format!("filename {filename}"),
     ];
     if let Some(dim) = &desc.dim {
         tag.push(format!("dim {dim}"));
@@ -164,13 +165,17 @@ pub(crate) fn parse_imeta(event: &nostr::Event) -> Vec<BuzzAttachment> {
                 })
             };
             let url = field("url")?;
-            let name = Url::parse(&url)
-                .ok()
-                .and_then(|u| {
-                    u.path_segments()
-                        .and_then(|mut s| s.next_back().map(str::to_owned))
+            let name = field("filename")
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| {
+                    Url::parse(&url)
+                        .ok()
+                        .and_then(|u| {
+                            u.path_segments()
+                                .and_then(|mut s| s.next_back().map(str::to_owned))
+                        })
+                        .filter(|n| !n.is_empty())
                 })
-                .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| "file".to_owned());
             Some(BuzzAttachment {
                 mime: field("m").unwrap_or_else(|| "application/octet-stream".to_owned()),
@@ -271,13 +276,14 @@ mod tests {
     #[test]
     fn imeta_tag_matches_buzz_cli_format() {
         assert_eq!(
-            imeta_tag(&desc("image/png")),
+            imeta_tag(&desc("image/png"), "shot.png"),
             vec![
                 "imeta",
                 "url https://buzz.example.test/media/aa.png",
                 "m image/png",
                 "x aa",
                 "size 10",
+                "filename shot.png",
                 "dim 2x3",
             ]
         );
@@ -320,6 +326,21 @@ mod tests {
                 name: "aa.pdf".into(),
             }]
         );
+    }
+
+    #[test]
+    fn parse_imeta_prefers_the_filename_field() {
+        let event = EventBuilder::new(Kind::Custom(9), "hi")
+            .tags(vec![Tag::parse([
+                "imeta",
+                "url https://buzz.example.test/media/3fa9.pdf",
+                "m application/pdf",
+                "filename Q3 report.pdf",
+            ])
+            .unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(parse_imeta(&event)[0].name, "Q3 report.pdf");
     }
 
     #[test]

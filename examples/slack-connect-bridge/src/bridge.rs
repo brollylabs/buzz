@@ -453,7 +453,7 @@ impl Bridge {
             match self.copy_slack_file(file).await {
                 Ok(desc) => {
                     attachment_lines.push(crate::media::media_markdown(&desc, &file.name));
-                    media_tags.push(crate::media::imeta_tag(&desc));
+                    media_tags.push(crate::media::imeta_tag(&desc, &file.name));
                     info!(%event_id, name = %file.name, size = file.size, mime = %file.mimetype, "copied Slack file to Buzz");
                 }
                 Err(failure) => {
