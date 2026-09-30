@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
-use nostr::{Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
+use nostr::{Event, EventBuilder, EventId, FromBech32, Keys, Kind, Tag, Timestamp};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
@@ -20,8 +20,8 @@ use crate::{
     config::{ChannelMapping, Config},
     media::{parse_imeta, strip_media_markdown},
     slack::{
-        escape_markdown_label, slack_mrkdwn_to_markdown, SlackClient, SlackDelivery, SlackEvent,
-        SlackFile, WebhookControl,
+        escape_markdown_label, slack_mrkdwn_to_markdown, slack_user_mentions, SlackClient,
+        SlackDelivery, SlackEvent, SlackFile, WebhookControl,
     },
     state::{SlackMessageRef, StateStore},
     transfer::{copy_slack_files, deliver_buzz_message, BuzzDelivery, SlackCopyResult},
@@ -82,6 +82,8 @@ struct SlackOriginInput<'a> {
     media_tags: &'a [Vec<String>],
 }
 
+/// Mentions resolved to names per message; the rest keep their raw IDs.
+const MAX_RESOLVED_MENTIONS: usize = 20;
 /// Retries for publishing a copied Slack message after a relay error.
 const MAX_PUBLISH_ATTEMPTS: u8 = 3;
 /// At most this many file transfers run at once (spec: bounded work).
@@ -100,6 +102,7 @@ struct PendingSlackMessage {
     author: String,
     reply_to: Option<EventId>,
     fallback_label: &'static str,
+    mention_names: HashMap<String, String>,
     buzz_channel_id: Uuid,
     attempts: u8,
 }
@@ -116,7 +119,7 @@ struct BuzzTransferDone {
 
 enum TransferDone {
     Slack {
-        pending: PendingSlackMessage,
+        pending: Box<PendingSlackMessage>,
         result: SlackCopyResult,
     },
     Buzz {
@@ -490,6 +493,14 @@ impl Bridge {
         }
 
         let author = self.slack_display_name(user_id).await?;
+        let mut mention_names = HashMap::new();
+        for mentioned in slack_user_mentions(text)
+            .into_iter()
+            .take(MAX_RESOLVED_MENTIONS)
+        {
+            let name = self.slack_display_name(&mentioned).await?;
+            mention_names.insert(mentioned, name);
+        }
         let reply_to = thread_ts
             .filter(|root_ts| *root_ts != ts)
             .and_then(|root_ts| {
@@ -519,6 +530,7 @@ impl Bridge {
             author,
             reply_to,
             fallback_label,
+            mention_names,
             buzz_channel_id: route.buzz_channel_id,
             attempts: 0,
         };
@@ -542,7 +554,10 @@ impl Bridge {
         tokio::spawn(async move {
             let _permit = permits.acquire_owned().await;
             let result = copy_slack_files(&slack, &buzz, &files, cap).await;
-            let _ = done_tx.send(TransferDone::Slack { pending, result });
+            let _ = done_tx.send(TransferDone::Slack {
+                pending: Box::new(pending),
+                result,
+            });
         });
         info!(%event_id, "queued Slack files for copying");
         Ok(())
@@ -559,6 +574,7 @@ impl Bridge {
             pending.fallback_label,
             &pending.text,
             &copied.lines,
+            &pending.mention_names,
         );
         let event = build_slack_origin_event(
             &self.config.bridge_keys,
@@ -640,9 +656,19 @@ impl Bridge {
             .state
             .canonical_channel_id(&route.slack_team_id, &route.slack_channel_id);
 
+        let mut mention_names = HashMap::new();
+        for pubkey in npub_mentions(&event.content)
+            .into_iter()
+            .take(MAX_RESOLVED_MENTIONS)
+        {
+            let name = self.buzz_display_name(&pubkey).await;
+            mention_names.insert(pubkey, name);
+        }
+        let content = replace_npub_mentions(&event.content, &mention_names);
+
         let attachments = parse_imeta(event);
         if attachments.is_empty() {
-            let text = compose_buzz_comment(&author, fallback_label, &event.content, &[]);
+            let text = compose_buzz_comment(&author, fallback_label, &content, &[]);
             let posted = self
                 .slack
                 .post_message(&channel_id, &text, thread_ts.as_deref(), &event_id_hex)
@@ -674,7 +700,7 @@ impl Bridge {
             thread_ts: thread_ts.clone(),
             comment_author: author,
             fallback_label,
-            body: strip_media_markdown(&event.content, &urls),
+            body: strip_media_markdown(&content, &urls),
             attachments,
             client_msg_id: event_id_hex.clone(),
         };
@@ -979,12 +1005,13 @@ fn compose_slack_origin_content(
     fallback_label: &str,
     text: &str,
     attachments: &[String],
+    mention_names: &HashMap<String, String>,
 ) -> String {
     let mut content = format!(
         "**{} · Slack**\n{}{}",
         escape_markdown_label(author),
         fallback_label,
-        slack_mrkdwn_to_markdown(text)
+        slack_mrkdwn_to_markdown(text, mention_names)
     );
     for line in attachments {
         if !content.ends_with('\n') {
@@ -993,6 +1020,41 @@ fn compose_slack_origin_content(
         content.push_str(line);
     }
     content
+}
+
+/// Pubkeys (hex) of NIP-27 `nostr:npub1…` mentions in Buzz content.
+fn npub_mentions(content: &str) -> Vec<String> {
+    buzz_sdk::mentions::extract_nostr_uris(content)
+}
+
+/// Replace `nostr:npub1…` mentions whose pubkey is in `names` with `@name`.
+/// Unknown or malformed mentions stay as they are.
+fn replace_npub_mentions(content: &str, names: &HashMap<String, String>) -> String {
+    const PREFIX: &str = "nostr:npub1";
+    const LEN: usize = PREFIX.len() + 58;
+    let mut output = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find(PREFIX) {
+        output.push_str(&rest[..start]);
+        let candidate = rest.get(start..start + LEN);
+        let name = candidate.and_then(|uri| {
+            let pubkey = nostr::PublicKey::from_bech32(&uri["nostr:".len()..]).ok()?;
+            names.get(&pubkey.to_hex())
+        });
+        match (candidate, name) {
+            (Some(_), Some(name)) => {
+                output.push('@');
+                output.push_str(name);
+                rest = &rest[start + LEN..];
+            }
+            _ => {
+                output.push_str(PREFIX);
+                rest = &rest[start + PREFIX.len()..];
+            }
+        }
+    }
+    output.push_str(rest);
+    output
 }
 
 pub(crate) fn compose_buzz_comment(
@@ -1114,6 +1176,7 @@ pub(crate) fn escape_slack_message_body(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::ToBech32;
 
     #[test]
     fn slack_origin_is_deterministic_and_threaded() {
@@ -1166,6 +1229,7 @@ mod tests {
                 "![image](https://b/media/aa.png)".into(),
                 "📎 big.mov (too large to copy) — [open in Slack](https://s/f)".into(),
             ],
+            &HashMap::new(),
         );
         assert_eq!(
             content,
@@ -1174,9 +1238,33 @@ mod tests {
     }
 
     #[test]
+    fn slack_origin_content_uses_mention_names() {
+        let names = HashMap::from([("U1".to_owned(), "Jumair".to_owned())]);
+        assert_eq!(
+            compose_slack_origin_content("ram", "", "<@U1> see PR", &[], &names),
+            "**ram · Slack**\n@Jumair see PR"
+        );
+    }
+
+    #[test]
+    fn replaces_npub_mentions_with_names() {
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let npub = keys.public_key().to_bech32().unwrap();
+        let other = Keys::generate().public_key().to_bech32().unwrap();
+        let content = format!("hi nostr:{npub}, cc nostr:{other} and nostr:npub1short");
+        assert_eq!(npub_mentions(&content).len(), 2);
+        let names = HashMap::from([(hex, "Ram".to_owned())]);
+        assert_eq!(
+            replace_npub_mentions(&content, &names),
+            format!("hi @Ram, cc nostr:{other} and nostr:npub1short")
+        );
+    }
+
+    #[test]
     fn slack_origin_content_text_only_is_unchanged() {
         assert_eq!(
-            compose_slack_origin_content("ram", "", "hello", &[]),
+            compose_slack_origin_content("ram", "", "hello", &[], &HashMap::new()),
             "**ram · Slack**\nhello"
         );
     }
