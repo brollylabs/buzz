@@ -19,7 +19,7 @@ use crate::{
     config::{ChannelMapping, Config},
     slack::{
         escape_markdown_label, slack_mrkdwn_to_markdown, SlackClient, SlackDelivery, SlackEvent,
-        SlackFile, WebhookControl,
+        SlackFile, UploadFile, WebhookControl,
     },
     state::{SlackMessageRef, StateStore},
 };
@@ -564,36 +564,102 @@ impl Bridge {
         } else {
             ""
         };
-        let text = format!(
-            "*{} · Buzz*\n{}{}",
-            escape_slack_label(&author),
-            fallback_label,
-            escape_slack_message_body(&event.content)
-        );
+        let attachments = crate::media::parse_imeta(event);
+        let urls: Vec<String> = attachments.iter().map(|a| a.url.clone()).collect();
+        let body = crate::media::strip_media_markdown(&event.content, &urls);
+        let mut uploads = Vec::new();
+        let mut failures = Vec::new();
+        for attachment in &attachments {
+            let result = if attachment
+                .size
+                .is_some_and(|size| size > self.config.max_file_bytes)
+            {
+                Err(crate::media::CopyFailure::TooLarge)
+            } else {
+                self.buzz_media
+                    .download(
+                        &attachment.url,
+                        &attachment.mime,
+                        self.config.max_file_bytes,
+                    )
+                    .await
+            };
+            match result {
+                Ok(bytes) => uploads.push(UploadFile {
+                    name: attachment.name.clone(),
+                    mime: attachment.mime.clone(),
+                    body: bytes,
+                }),
+                Err(failure) => {
+                    warn!(name = %attachment.name, reason = failure.reason(), "Buzz file not copied");
+                    failures.push(format!(
+                        "📎 {} ({}) — see Buzz",
+                        attachment.name,
+                        failure.reason()
+                    ));
+                }
+            }
+        }
+        let text = compose_buzz_comment(&author, fallback_label, &body, &failures);
         let channel_id = self
             .state
             .canonical_channel_id(&route.slack_team_id, &route.slack_channel_id);
-        let posted = self
-            .slack
-            .post_message(&channel_id, &text, thread_ts.as_deref(), &event.id.to_hex())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to post Buzz event {} to mapped Slack channel",
-                    event.id.to_hex()
-                )
-            })?;
+        let event_id_hex = event.id.to_hex();
+        let posted_ts = if uploads.is_empty() {
+            Some(
+                self.slack
+                    .post_message(&channel_id, &text, thread_ts.as_deref(), &event_id_hex)
+                    .await
+                    .with_context(|| {
+                        format!("failed to post Buzz event {event_id_hex} to mapped Slack channel")
+                    })?
+                    .ts,
+            )
+        } else {
+            match self
+                .slack
+                .upload_files(&channel_id, thread_ts.as_deref(), &text, uploads)
+                .await
+            {
+                Ok(ts) => ts,
+                Err(error) => {
+                    warn!(%error, "Slack file upload failed; posting text only");
+                    let all_failed: Vec<String> = attachments
+                        .iter()
+                        .map(|a| format!("📎 {} (couldn't copy) — see Buzz", a.name))
+                        .collect();
+                    let text = compose_buzz_comment(&author, fallback_label, &body, &all_failed);
+                    Some(
+                        self.slack
+                            .post_message(&channel_id, &text, thread_ts.as_deref(), &event_id_hex)
+                            .await
+                            .with_context(|| {
+                                format!("failed to post Buzz event {event_id_hex} to mapped Slack channel")
+                            })?
+                            .ts,
+                    )
+                }
+            }
+        };
 
-        self.state.record_message_pair(
-            route.buzz_channel_id,
-            &event.id.to_hex(),
-            SlackMessageRef {
-                team_id: route.slack_team_id,
-                channel_id,
-                ts: posted.ts,
-                thread_ts,
-            },
-        )?;
+        match posted_ts {
+            Some(ts) => {
+                self.state.record_message_pair(
+                    route.buzz_channel_id,
+                    &event_id_hex,
+                    SlackMessageRef {
+                        team_id: route.slack_team_id,
+                        channel_id,
+                        ts,
+                        thread_ts,
+                    },
+                )?;
+            }
+            None => info!(
+                buzz_event_id = %event_id_hex,
+                "Slack did not report the upload's ts; replies will fall back to channel level"
+            ),
+        }
         info!(
             buzz_event_id = %event.id.to_hex(),
             buzz_channel_id = %route.buzz_channel_id,
@@ -831,6 +897,27 @@ fn compose_slack_origin_content(
     content
 }
 
+fn compose_buzz_comment(
+    author: &str,
+    fallback_label: &str,
+    content: &str,
+    failures: &[String],
+) -> String {
+    let mut text = format!(
+        "*{} · Buzz*\n{}{}",
+        escape_slack_label(author),
+        fallback_label,
+        escape_slack_message_body(content)
+    );
+    for line in failures {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&escape_slack_message_body(line));
+    }
+    text
+}
+
 async fn send_event_checked(connection: &mut NostrWsConnection, event: Event) -> Result<()> {
     let event_id = event.id.to_hex();
     let response = connection.send_event(event).await?;
@@ -1023,6 +1110,25 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.as_slice().first().map(String::as_str) == Some("imeta")));
+    }
+
+    #[test]
+    fn buzz_comment_escapes_and_lists_failures() {
+        let comment = compose_buzz_comment(
+            "ram",
+            "",
+            "see <!channel>",
+            &["📎 big.mp4 (too large to copy) — see Buzz".into()],
+        );
+        assert_eq!(
+            comment,
+            "*ram · Buzz*\nsee &lt;!channel&gt;\n📎 big.mp4 (too large to copy) — see Buzz"
+        );
+    }
+
+    #[test]
+    fn buzz_comment_without_text() {
+        assert_eq!(compose_buzz_comment("ram", "", "", &[]), "*ram · Buzz*\n");
     }
 
     #[test]

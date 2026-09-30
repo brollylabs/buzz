@@ -3,7 +3,7 @@
 mod api;
 mod webhook;
 
-pub(crate) use api::SlackClient;
+pub(crate) use api::{SlackClient, UploadFile};
 pub(crate) use webhook::{
     run_webhook_server, SlackDelivery, SlackEvent, SlackFile, WebhookControl, WebhookServerState,
 };
