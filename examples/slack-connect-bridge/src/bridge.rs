@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    buzz_media::BuzzMedia,
     config::{ChannelMapping, Config},
     slack::{
         escape_markdown_label, slack_mrkdwn_to_markdown, SlackClient, SlackDelivery, SlackEvent,
@@ -36,6 +37,7 @@ pub(crate) struct Bridge {
     config: Config,
     state: StateStore,
     slack: SlackClient,
+    buzz_media: BuzzMedia,
     slack_bot_user_id: String,
     delivery_rx: mpsc::Receiver<SlackDelivery>,
     webhook: WebhookControl,
@@ -70,6 +72,7 @@ struct SlackOriginInput<'a> {
     user_id: &'a str,
     thread_ts: Option<&'a str>,
     reply_to: Option<EventId>,
+    media_tags: &'a [Vec<String>],
 }
 
 impl Bridge {
@@ -82,11 +85,13 @@ impl Bridge {
         let slack = SlackClient::new(config.slack_bot_token.clone())?;
         let identity = slack.auth_test().await?;
         validate_installation(&config, &identity.team_id)?;
+        let buzz_media = BuzzMedia::new(&config.relay_url, config.bridge_keys.clone())?;
 
         let mut bridge = Self {
             config,
             state,
             slack,
+            buzz_media,
             slack_bot_user_id: identity.user_id,
             delivery_rx,
             webhook,
@@ -386,7 +391,7 @@ impl Bridge {
             ts,
             thread_ts,
             is_ext_shared,
-            files: _,
+            files,
         } = input;
         if user_id == self.slack_bot_user_id {
             return Ok(());
@@ -419,8 +424,8 @@ impl Bridge {
         {
             return Ok(());
         }
-        if text.trim().is_empty() {
-            info!(%event_id, "ignored Slack message without text");
+        if text.trim().is_empty() && files.is_empty() {
+            info!(%event_id, "ignored Slack message without text or files");
             return Ok(());
         }
 
@@ -442,12 +447,32 @@ impl Bridge {
         } else {
             ""
         };
-        let content = format!(
-            "**{} · Slack**\n{}{}",
-            escape_markdown_label(&author),
-            fallback_label,
-            slack_mrkdwn_to_markdown(text)
-        );
+        let mut attachment_lines = Vec::new();
+        let mut media_tags = Vec::new();
+        for file in files {
+            match self.copy_slack_file(file).await {
+                Ok(desc) => {
+                    attachment_lines.push(crate::media::media_markdown(&desc, &file.name));
+                    media_tags.push(crate::media::imeta_tag(&desc));
+                    info!(%event_id, name = %file.name, size = file.size, mime = %file.mimetype, "copied Slack file to Buzz");
+                }
+                Err(failure) => {
+                    warn!(%event_id, name = %file.name, size = file.size, reason = failure.reason(), "Slack file not copied");
+                    let link = file
+                        .permalink
+                        .as_deref()
+                        .map(|permalink| format!(" — [open in Slack]({permalink})"))
+                        .unwrap_or_default();
+                    attachment_lines.push(format!(
+                        "📎 {} ({}){link}",
+                        file.name.replace(['[', ']'], ""),
+                        failure.reason()
+                    ));
+                }
+            }
+        }
+        let content =
+            compose_slack_origin_content(&author, fallback_label, text, &attachment_lines);
         let event = build_slack_origin_event(
             &self.config.bridge_keys,
             SlackOriginInput {
@@ -459,6 +484,7 @@ impl Bridge {
                 user_id,
                 thread_ts,
                 reply_to,
+                media_tags: &media_tags,
             },
         )?;
         let buzz_event_id = event.id.to_hex();
@@ -482,6 +508,24 @@ impl Bridge {
             "bridged Slack message to Buzz"
         );
         Ok(())
+    }
+
+    async fn copy_slack_file(
+        &self,
+        file: &SlackFile,
+    ) -> Result<crate::media::BlobDescriptor, crate::media::CopyFailure> {
+        use crate::media::CopyFailure;
+        if file.size > self.config.max_file_bytes {
+            return Err(CopyFailure::TooLarge);
+        }
+        let Some(url) = file.url_private_download.as_deref() else {
+            return Err(CopyFailure::Unavailable);
+        };
+        let body = self
+            .slack
+            .download_file(url, &file.mimetype, self.config.max_file_bytes)
+            .await?;
+        self.buzz_media.upload(body, &file.mimetype).await
     }
 
     async fn process_buzz_event(&mut self, event: &Event) -> Result<()> {
@@ -732,6 +776,7 @@ fn build_slack_origin_event(keys: &Keys, input: SlackOriginInput<'_>) -> Result<
         user_id,
         thread_ts,
         reply_to,
+        media_tags,
     } = input;
     if content.len() > 64 * 1024 {
         bail!("Slack message exceeds Buzz's 64 KiB message limit");
@@ -750,6 +795,11 @@ fn build_slack_origin_event(keys: &Keys, input: SlackOriginInput<'_>) -> Result<
         let reply_to = reply_to.to_hex();
         tags.push(Tag::parse(["e", reply_to.as_str(), "", "reply"])?);
     }
+    for media in media_tags {
+        tags.push(Tag::parse(
+            media.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?);
+    }
     let created_at = slack_timestamp(slack_ts)?;
     Ok(EventBuilder::new(
         Kind::Custom(buzz_sdk::kind::KIND_STREAM_MESSAGE as u16),
@@ -758,6 +808,27 @@ fn build_slack_origin_event(keys: &Keys, input: SlackOriginInput<'_>) -> Result<
     .tags(tags)
     .custom_created_at(created_at)
     .sign_with_keys(keys)?)
+}
+
+fn compose_slack_origin_content(
+    author: &str,
+    fallback_label: &str,
+    text: &str,
+    attachments: &[String],
+) -> String {
+    let mut content = format!(
+        "**{} · Slack**\n{}{}",
+        escape_markdown_label(author),
+        fallback_label,
+        slack_mrkdwn_to_markdown(text)
+    );
+    for line in attachments {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(line);
+    }
+    content
 }
 
 async fn send_event_checked(connection: &mut NostrWsConnection, event: Event) -> Result<()> {
@@ -875,6 +946,7 @@ mod tests {
                 user_id: "U12345678",
                 thread_ts: Some("1699999999.000001"),
                 reply_to: Some(root),
+                media_tags: &[],
             },
         )
         .unwrap();
@@ -889,6 +961,7 @@ mod tests {
                 user_id: "U12345678",
                 thread_ts: Some("1699999999.000001"),
                 reply_to: Some(root),
+                media_tags: &[],
             },
         )
         .unwrap();
@@ -896,6 +969,60 @@ mod tests {
         assert!(has_slack_origin(&first));
         assert_eq!(event_thread_root(&first), Some("a".repeat(64)));
         assert_eq!(event_channel_id(&first), Some(channel));
+    }
+
+    #[test]
+    fn slack_origin_content_with_files_and_no_text() {
+        let content = compose_slack_origin_content(
+            "ram",
+            "",
+            "",
+            &[
+                "![image](https://b/media/aa.png)".into(),
+                "📎 big.mov (too large to copy) — [open in Slack](https://s/f)".into(),
+            ],
+        );
+        assert_eq!(
+            content,
+            "**ram · Slack**\n![image](https://b/media/aa.png)\n📎 big.mov (too large to copy) — [open in Slack](https://s/f)"
+        );
+    }
+
+    #[test]
+    fn slack_origin_content_text_only_is_unchanged() {
+        assert_eq!(
+            compose_slack_origin_content("ram", "", "hello", &[]),
+            "**ram · Slack**\nhello"
+        );
+    }
+
+    #[test]
+    fn slack_origin_event_carries_imeta_tags() {
+        let keys = Keys::generate();
+        let media = vec![vec![
+            "imeta".to_string(),
+            "url https://b/media/aa.png".into(),
+            "m image/png".into(),
+        ]];
+        let event = build_slack_origin_event(
+            &keys,
+            SlackOriginInput {
+                buzz_channel_id: Uuid::new_v4(),
+                content: "x",
+                team_id: "T1",
+                channel_id: "C1",
+                slack_ts: "1790000000.000100",
+                user_id: "U1",
+                thread_ts: None,
+                reply_to: None,
+                media_tags: &media,
+            },
+        )
+        .unwrap();
+        assert!(event
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(String::as_str) == Some("imeta")));
     }
 
     #[test]
