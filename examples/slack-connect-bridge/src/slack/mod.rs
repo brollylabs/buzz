@@ -5,7 +5,7 @@ mod webhook;
 
 pub(crate) use api::SlackClient;
 pub(crate) use webhook::{
-    run_webhook_server, SlackDelivery, SlackEvent, WebhookControl, WebhookServerState,
+    run_webhook_server, SlackDelivery, SlackEvent, SlackFile, WebhookControl, WebhookServerState,
 };
 
 /// Convert the subset of Slack mrkdwn that would otherwise be unreadable in

@@ -18,7 +18,7 @@ use crate::{
     config::{ChannelMapping, Config},
     slack::{
         escape_markdown_label, slack_mrkdwn_to_markdown, SlackClient, SlackDelivery, SlackEvent,
-        WebhookControl,
+        SlackFile, WebhookControl,
     },
     state::{SlackMessageRef, StateStore},
 };
@@ -58,6 +58,7 @@ struct SlackMessageInput<'a> {
     ts: &'a str,
     thread_ts: Option<&'a str>,
     is_ext_shared: Option<bool>,
+    files: &'a [SlackFile],
 }
 
 struct SlackOriginInput<'a> {
@@ -279,6 +280,7 @@ impl Bridge {
                 ts,
                 thread_ts,
                 is_ext_shared,
+                files,
             } => {
                 self.bridge_slack_message(
                     connection,
@@ -291,6 +293,7 @@ impl Bridge {
                         ts: &ts,
                         thread_ts: thread_ts.as_deref(),
                         is_ext_shared,
+                        files: &files,
                     },
                 )
                 .await
@@ -383,6 +386,7 @@ impl Bridge {
             ts,
             thread_ts,
             is_ext_shared,
+            files: _,
         } = input;
         if user_id == self.slack_bot_user_id {
             return Ok(());

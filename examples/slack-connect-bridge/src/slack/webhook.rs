@@ -37,6 +37,7 @@ pub(crate) enum SlackEvent {
         ts: String,
         thread_ts: Option<String>,
         is_ext_shared: Option<bool>,
+        files: Vec<SlackFile>,
     },
     ChannelIdChanged {
         event_id: String,
@@ -55,6 +56,17 @@ pub(crate) enum SlackEvent {
         channel_id: String,
         is_ext_shared: bool,
     },
+}
+
+/// A file attached to a Slack message (`event.files[]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlackFile {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) mimetype: String,
+    pub(crate) size: u64,
+    pub(crate) url_private_download: Option<String>,
+    pub(crate) permalink: Option<String>,
 }
 
 pub(crate) struct SlackDelivery {
@@ -280,7 +292,7 @@ fn parse_message(
         return Ok(None);
     }
     let subtype = event.get("subtype").and_then(Value::as_str);
-    if subtype.is_some_and(|value| value != "thread_broadcast") {
+    if subtype.is_some_and(|value| value != "thread_broadcast" && value != "file_share") {
         return Ok(None);
     }
 
@@ -298,7 +310,28 @@ fn parse_message(
         is_ext_shared: payload
             .get("is_ext_shared_channel")
             .and_then(Value::as_bool),
+        files: parse_files(event),
     }))
+}
+
+fn parse_files(event: &Value) -> Vec<SlackFile> {
+    let Some(items) = event.get("files").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|file| {
+            let text = |field: &str| file.get(field).and_then(Value::as_str).map(str::to_owned);
+            Some(SlackFile {
+                id: text("id")?,
+                name: text("name").unwrap_or_else(|| "file".to_owned()),
+                mimetype: text("mimetype").unwrap_or_else(|| "application/octet-stream".to_owned()),
+                size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
+                url_private_download: text("url_private_download"),
+                permalink: text("permalink"),
+            })
+        })
+        .collect()
 }
 
 fn required(value: &Value, field: &str) -> Result<String> {
@@ -404,6 +437,7 @@ mod tests {
                 ts: "1700000000.000001".into(),
                 thread_ts: Some("1699999999.000001".into()),
                 is_ext_shared: Some(true),
+                files: Vec::new(),
             })
         );
     }
@@ -517,6 +551,67 @@ mod tests {
             slack_events(State(state), current_signed_headers(b"secret", &body), body).await;
         processing.await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn file_share_payload(user: &str, bot: bool, with_url: bool) -> Value {
+        let mut file = json!({
+            "id": "F1", "name": "shot.png", "mimetype": "image/png", "size": 1234,
+            "permalink": "https://catalyzex.slack.com/files/U1/F1/shot.png"
+        });
+        if with_url {
+            file["url_private_download"] =
+                json!("https://files.slack.com/files-pri/T1-F1/download/shot.png");
+        }
+        let mut event = json!({
+            "type": "message", "subtype": "file_share", "channel": "C1", "user": user,
+            "text": "", "ts": "1790000000.000100", "files": [file]
+        });
+        if bot {
+            event["bot_id"] = json!("B1");
+        }
+        json!({"type": "event_callback", "event_id": "Ev1", "team_id": "T1", "event": event})
+    }
+
+    #[test]
+    fn parses_file_share_with_files_and_empty_text() {
+        let parsed = parse_callback(&file_share_payload("U1", false, true))
+            .unwrap()
+            .unwrap();
+        let SlackEvent::Message { text, files, .. } = parsed else {
+            panic!("not a message")
+        };
+        assert_eq!(text, "");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "shot.png");
+        assert_eq!(files[0].size, 1234);
+        assert!(files[0].url_private_download.is_some());
+    }
+
+    #[test]
+    fn file_without_download_url_is_kept_for_fallback() {
+        let parsed = parse_callback(&file_share_payload("U1", false, false))
+            .unwrap()
+            .unwrap();
+        let SlackEvent::Message { files, .. } = parsed else {
+            panic!("not a message")
+        };
+        assert_eq!(files[0].url_private_download, None);
+        assert!(files[0].permalink.is_some());
+    }
+
+    #[test]
+    fn bot_file_share_is_ignored() {
+        assert_eq!(
+            parse_callback(&file_share_payload("UBOT", true, true)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn other_subtypes_are_still_ignored() {
+        let mut payload = file_share_payload("U1", false, true);
+        payload["event"]["subtype"] = json!("channel_join");
+        assert_eq!(parse_callback(&payload).unwrap(), None);
     }
 
     #[test]
