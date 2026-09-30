@@ -315,23 +315,26 @@ fn parse_message(
 }
 
 fn parse_files(event: &Value) -> Vec<SlackFile> {
-    let Some(items) = event.get("files").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|file| {
-            let text = |field: &str| file.get(field).and_then(Value::as_str).map(str::to_owned);
-            Some(SlackFile {
-                id: text("id")?,
-                name: text("name").unwrap_or_else(|| "file".to_owned()),
-                mimetype: text("mimetype").unwrap_or_else(|| "application/octet-stream".to_owned()),
-                size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
-                url_private_download: text("url_private_download"),
-                permalink: text("permalink"),
-            })
-        })
-        .collect()
+    event
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(parse_file).collect())
+        .unwrap_or_default()
+}
+
+/// One Slack file object. Slack Connect files from another organisation may
+/// arrive with only an `id` (`file_access: check_file_info`); callers then
+/// hydrate them with `files.info`.
+pub(crate) fn parse_file(file: &Value) -> Option<SlackFile> {
+    let text = |field: &str| file.get(field).and_then(Value::as_str).map(str::to_owned);
+    Some(SlackFile {
+        id: text("id")?,
+        name: text("name").unwrap_or_else(|| "file".to_owned()),
+        mimetype: text("mimetype").unwrap_or_else(|| "application/octet-stream".to_owned()),
+        size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
+        url_private_download: text("url_private_download"),
+        permalink: text("permalink"),
+    })
 }
 
 fn required(value: &Value, field: &str) -> Result<String> {

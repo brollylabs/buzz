@@ -7,6 +7,7 @@ mod config;
 mod media;
 mod slack;
 mod state;
+mod transfer;
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};

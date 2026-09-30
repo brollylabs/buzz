@@ -1,8 +1,9 @@
 //! Live Slack Connect ↔ Buzz message bridge.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
     time::Duration,
 };
 
@@ -10,18 +11,20 @@ use anyhow::{bail, Context, Result};
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
 use nostr::{Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     buzz_media::BuzzMedia,
     config::{ChannelMapping, Config},
+    media::{parse_imeta, strip_media_markdown},
     slack::{
         escape_markdown_label, slack_mrkdwn_to_markdown, SlackClient, SlackDelivery, SlackEvent,
-        SlackFile, UploadFile, WebhookControl,
+        SlackFile, WebhookControl,
     },
     state::{SlackMessageRef, StateStore},
+    transfer::{copy_slack_files, deliver_buzz_message, BuzzDelivery, SlackCopyResult},
 };
 
 const SUBSCRIPTION_ID: &str = "slack-connect-bridge";
@@ -36,8 +39,12 @@ const PROFILE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct Bridge {
     config: Config,
     state: StateStore,
-    slack: SlackClient,
-    buzz_media: BuzzMedia,
+    slack: Arc<SlackClient>,
+    buzz_media: Arc<BuzzMedia>,
+    transfer_permits: Arc<Semaphore>,
+    transfers_tx: mpsc::UnboundedSender<TransferDone>,
+    transfers_rx: mpsc::UnboundedReceiver<TransferDone>,
+    in_flight: HashSet<String>,
     slack_bot_user_id: String,
     delivery_rx: mpsc::Receiver<SlackDelivery>,
     webhook: WebhookControl,
@@ -75,6 +82,49 @@ struct SlackOriginInput<'a> {
     media_tags: &'a [Vec<String>],
 }
 
+/// Retries for publishing a copied Slack message after a relay error.
+const MAX_PUBLISH_ATTEMPTS: u8 = 3;
+/// At most this many file transfers run at once (spec: bounded work).
+const MAX_CONCURRENT_TRANSFERS: usize = 2;
+
+/// A Slack message whose files are being copied off the event loop.
+struct PendingSlackMessage {
+    key: String,
+    event_id: String,
+    team_id: String,
+    channel_id: String,
+    user_id: String,
+    text: String,
+    ts: String,
+    thread_ts: Option<String>,
+    author: String,
+    reply_to: Option<EventId>,
+    fallback_label: &'static str,
+    buzz_channel_id: Uuid,
+    attempts: u8,
+}
+
+/// Where a Buzz message with files was delivered, for recording the result.
+struct BuzzTransferDone {
+    key: String,
+    buzz_event_id: String,
+    buzz_channel_id: Uuid,
+    team_id: String,
+    channel_id: String,
+    thread_ts: Option<String>,
+}
+
+enum TransferDone {
+    Slack {
+        pending: PendingSlackMessage,
+        result: SlackCopyResult,
+    },
+    Buzz {
+        done: BuzzTransferDone,
+        result: std::result::Result<Option<String>, String>,
+    },
+}
+
 impl Bridge {
     pub(crate) async fn initialize(
         config: Config,
@@ -86,12 +136,17 @@ impl Bridge {
         let identity = slack.auth_test().await?;
         validate_installation(&config, &identity.team_id)?;
         let buzz_media = BuzzMedia::new(&config.relay_url, config.bridge_keys.clone())?;
+        let (transfers_tx, transfers_rx) = mpsc::unbounded_channel();
 
         let mut bridge = Self {
             config,
             state,
-            slack,
-            buzz_media,
+            slack: Arc::new(slack),
+            buzz_media: Arc::new(buzz_media),
+            transfer_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
+            transfers_tx,
+            transfers_rx,
+            in_flight: HashSet::new(),
             slack_bot_user_id: identity.user_id,
             delivery_rx,
             webhook,
@@ -169,6 +224,9 @@ impl Bridge {
                     if let Err(error) = result {
                         warn!(reason = %error, "Slack event was not bridged");
                     }
+                }
+                Some(done) = self.transfers_rx.recv() => {
+                    self.handle_transfer_done(&mut connection, done).await?;
                 }
                 relay_message = connection.next_event(RELAY_POLL_TIMEOUT) => {
                     match relay_message {
@@ -417,10 +475,12 @@ impl Bridge {
             );
             return Ok(());
         }
+        let key = format!("slack:{}:{ts}", route.buzz_channel_id);
         if self
             .state
             .buzz_event_for_slack(route.buzz_channel_id, ts)
             .is_some()
+            || self.in_flight.contains(&key)
         {
             return Ok(());
         }
@@ -447,94 +507,106 @@ impl Bridge {
         } else {
             ""
         };
-        let mut attachment_lines = Vec::new();
-        let mut media_tags = Vec::new();
-        for file in files {
-            match self.copy_slack_file(file).await {
-                Ok(desc) => {
-                    attachment_lines.push(crate::media::media_markdown(&desc, &file.name));
-                    media_tags.push(crate::media::imeta_tag(&desc, &file.name));
-                    info!(%event_id, name = %file.name, size = file.size, mime = %file.mimetype, "copied Slack file to Buzz");
-                }
-                Err(failure) => {
-                    warn!(%event_id, name = %file.name, size = file.size, reason = failure.reason(), "Slack file not copied");
-                    let link = file
-                        .permalink
-                        .as_deref()
-                        .map(|permalink| format!(" — [open in Slack]({permalink})"))
-                        .unwrap_or_default();
-                    attachment_lines.push(format!(
-                        "📎 {} ({}){link}",
-                        file.name.replace(['[', ']'], ""),
-                        failure.reason()
-                    ));
-                }
-            }
+        let pending = PendingSlackMessage {
+            key,
+            event_id: event_id.to_owned(),
+            team_id: team_id.to_owned(),
+            channel_id: channel_id.to_owned(),
+            user_id: user_id.to_owned(),
+            text: text.to_owned(),
+            ts: ts.to_owned(),
+            thread_ts: thread_ts.map(str::to_owned),
+            author,
+            reply_to,
+            fallback_label,
+            buzz_channel_id: route.buzz_channel_id,
+            attempts: 0,
+        };
+        if files.is_empty() {
+            return self
+                .publish_slack_message(connection, &pending, &SlackCopyResult::default())
+                .await;
         }
-        let content =
-            compose_slack_origin_content(&author, fallback_label, text, &attachment_lines);
+
+        // Files are copied off the event loop; the result comes back through
+        // `transfers_rx` and is published by `handle_transfer_done`.
+        self.in_flight.insert(pending.key.clone());
+        let (slack, buzz, permits, done_tx) = (
+            Arc::clone(&self.slack),
+            Arc::clone(&self.buzz_media),
+            Arc::clone(&self.transfer_permits),
+            self.transfers_tx.clone(),
+        );
+        let files = files.to_vec();
+        let cap = self.config.max_file_bytes;
+        tokio::spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            let result = copy_slack_files(&slack, &buzz, &files, cap).await;
+            let _ = done_tx.send(TransferDone::Slack { pending, result });
+        });
+        info!(%event_id, "queued Slack files for copying");
+        Ok(())
+    }
+
+    async fn publish_slack_message(
+        &mut self,
+        connection: &mut NostrWsConnection,
+        pending: &PendingSlackMessage,
+        copied: &SlackCopyResult,
+    ) -> Result<()> {
+        let content = compose_slack_origin_content(
+            &pending.author,
+            pending.fallback_label,
+            &pending.text,
+            &copied.lines,
+        );
         let event = build_slack_origin_event(
             &self.config.bridge_keys,
             SlackOriginInput {
-                buzz_channel_id: route.buzz_channel_id,
+                buzz_channel_id: pending.buzz_channel_id,
                 content: &content,
-                team_id,
-                channel_id,
-                slack_ts: ts,
-                user_id,
-                thread_ts,
-                reply_to,
-                media_tags: &media_tags,
+                team_id: &pending.team_id,
+                channel_id: &pending.channel_id,
+                slack_ts: &pending.ts,
+                user_id: &pending.user_id,
+                thread_ts: pending.thread_ts.as_deref(),
+                reply_to: pending.reply_to,
+                media_tags: &copied.media_tags,
             },
         )?;
         let buzz_event_id = event.id.to_hex();
         send_event_checked(connection, event).await?;
 
-        let canonical_channel = self.state.canonical_channel_id(team_id, channel_id);
+        let canonical_channel = self
+            .state
+            .canonical_channel_id(&pending.team_id, &pending.channel_id);
         self.state.record_message_pair(
-            route.buzz_channel_id,
+            pending.buzz_channel_id,
             &buzz_event_id,
             SlackMessageRef {
-                team_id: team_id.to_owned(),
+                team_id: pending.team_id.clone(),
                 channel_id: canonical_channel,
-                ts: ts.to_owned(),
-                thread_ts: thread_ts.map(str::to_owned),
+                ts: pending.ts.clone(),
+                thread_ts: pending.thread_ts.clone(),
             },
         )?;
+        self.in_flight.remove(&pending.key);
         info!(
-            %event_id,
+            event_id = %pending.event_id,
             %buzz_event_id,
-            buzz_channel_id = %route.buzz_channel_id,
+            buzz_channel_id = %pending.buzz_channel_id,
             "bridged Slack message to Buzz"
         );
         Ok(())
     }
 
-    async fn copy_slack_file(
-        &self,
-        file: &SlackFile,
-    ) -> Result<crate::media::BlobDescriptor, crate::media::CopyFailure> {
-        use crate::media::CopyFailure;
-        if file.size > self.config.max_file_bytes {
-            return Err(CopyFailure::TooLarge);
-        }
-        let Some(url) = file.url_private_download.as_deref() else {
-            return Err(CopyFailure::Unavailable);
-        };
-        let body = self
-            .slack
-            .download_file(url, &file.mimetype, self.config.max_file_bytes)
-            .await?;
-        self.buzz_media.upload(body, &file.mimetype).await
-    }
-
     async fn process_buzz_event(&mut self, event: &Event) -> Result<()> {
+        let event_id_hex = event.id.to_hex();
+        let key = format!("buzz:{event_id_hex}");
         if event.pubkey == self.config.bridge_keys.public_key()
             || has_slack_origin(event)
-            || self
-                .state
-                .slack_message_for_buzz(&event.id.to_hex())
-                .is_some()
+            || self.state.was_delivered(&event_id_hex)
+            || self.in_flight.contains(&key)
         {
             return Ok(());
         }
@@ -564,108 +636,134 @@ impl Bridge {
         } else {
             ""
         };
-        let attachments = crate::media::parse_imeta(event);
-        let urls: Vec<String> = attachments.iter().map(|a| a.url.clone()).collect();
-        let body = crate::media::strip_media_markdown(&event.content, &urls);
-        let mut uploads = Vec::new();
-        let mut failures = Vec::new();
-        for attachment in &attachments {
-            let result = if attachment
-                .size
-                .is_some_and(|size| size > self.config.max_file_bytes)
-            {
-                Err(crate::media::CopyFailure::TooLarge)
-            } else {
-                self.buzz_media
-                    .download(
-                        &attachment.url,
-                        &attachment.mime,
-                        self.config.max_file_bytes,
-                    )
-                    .await
-            };
-            match result {
-                Ok(bytes) => uploads.push(UploadFile {
-                    name: attachment.name.clone(),
-                    mime: attachment.mime.clone(),
-                    body: bytes,
-                }),
-                Err(failure) => {
-                    warn!(name = %attachment.name, reason = failure.reason(), "Buzz file not copied");
-                    failures.push(format!(
-                        "📎 {} ({}) — see Buzz",
-                        attachment.name,
-                        failure.reason()
-                    ));
-                }
-            }
-        }
-        let text = compose_buzz_comment(&author, fallback_label, &body, &failures);
         let channel_id = self
             .state
             .canonical_channel_id(&route.slack_team_id, &route.slack_channel_id);
-        let event_id_hex = event.id.to_hex();
-        let posted_ts = if uploads.is_empty() {
-            Some(
-                self.slack
-                    .post_message(&channel_id, &text, thread_ts.as_deref(), &event_id_hex)
-                    .await
-                    .with_context(|| {
-                        format!("failed to post Buzz event {event_id_hex} to mapped Slack channel")
-                    })?
-                    .ts,
-            )
-        } else {
-            match self
-                .slack
-                .upload_files(&channel_id, thread_ts.as_deref(), &text, uploads)
-                .await
-            {
-                Ok(ts) => ts,
-                Err(error) => {
-                    warn!(%error, "Slack file upload failed; posting text only");
-                    let all_failed: Vec<String> = attachments
-                        .iter()
-                        .map(|a| format!("📎 {} (couldn't copy) — see Buzz", a.name))
-                        .collect();
-                    let text = compose_buzz_comment(&author, fallback_label, &body, &all_failed);
-                    Some(
-                        self.slack
-                            .post_message(&channel_id, &text, thread_ts.as_deref(), &event_id_hex)
-                            .await
-                            .with_context(|| {
-                                format!("failed to post Buzz event {event_id_hex} to mapped Slack channel")
-                            })?
-                            .ts,
-                    )
-                }
-            }
-        };
 
-        match posted_ts {
-            Some(ts) => {
-                self.state.record_message_pair(
-                    route.buzz_channel_id,
-                    &event_id_hex,
-                    SlackMessageRef {
-                        team_id: route.slack_team_id,
-                        channel_id,
-                        ts,
-                        thread_ts,
-                    },
-                )?;
-            }
-            None => info!(
+        let attachments = parse_imeta(event);
+        if attachments.is_empty() {
+            let text = compose_buzz_comment(&author, fallback_label, &event.content, &[]);
+            let posted = self
+                .slack
+                .post_message(&channel_id, &text, thread_ts.as_deref(), &event_id_hex)
+                .await
+                .with_context(|| {
+                    format!("failed to post Buzz event {event_id_hex} to mapped Slack channel")
+                })?;
+            self.state.record_message_pair(
+                route.buzz_channel_id,
+                &event_id_hex,
+                SlackMessageRef {
+                    team_id: route.slack_team_id,
+                    channel_id,
+                    ts: posted.ts,
+                    thread_ts,
+                },
+            )?;
+            info!(
                 buzz_event_id = %event_id_hex,
-                "Slack did not report the upload's ts; replies will fall back to channel level"
-            ),
+                buzz_channel_id = %route.buzz_channel_id,
+                "bridged Buzz message to Slack"
+            );
+            return Ok(());
         }
-        info!(
-            buzz_event_id = %event.id.to_hex(),
-            buzz_channel_id = %route.buzz_channel_id,
-            "bridged Buzz message to Slack"
+
+        let urls: Vec<String> = attachments.iter().map(|a| a.url.clone()).collect();
+        let delivery = BuzzDelivery {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+            comment_author: author,
+            fallback_label,
+            body: strip_media_markdown(&event.content, &urls),
+            attachments,
+            client_msg_id: event_id_hex.clone(),
+        };
+        self.in_flight.insert(key.clone());
+        let (slack, buzz, permits, done_tx) = (
+            Arc::clone(&self.slack),
+            Arc::clone(&self.buzz_media),
+            Arc::clone(&self.transfer_permits),
+            self.transfers_tx.clone(),
         );
+        let cap = self.config.max_file_bytes;
+        let done = BuzzTransferDone {
+            key,
+            buzz_event_id: event_id_hex.clone(),
+            buzz_channel_id: route.buzz_channel_id,
+            team_id: route.slack_team_id,
+            channel_id,
+            thread_ts,
+        };
+        tokio::spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            let result = deliver_buzz_message(&slack, &buzz, &delivery, cap)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = done_tx.send(TransferDone::Buzz { done, result });
+        });
+        info!(buzz_event_id = %event_id_hex, "queued Buzz files for Slack");
         Ok(())
+    }
+
+    /// Publish or record the outcome of a background file transfer.
+    async fn handle_transfer_done(
+        &mut self,
+        connection: &mut NostrWsConnection,
+        done: TransferDone,
+    ) -> Result<()> {
+        match done {
+            TransferDone::Slack {
+                mut pending,
+                result,
+            } => {
+                if let Err(error) = self
+                    .publish_slack_message(connection, &pending, &result)
+                    .await
+                {
+                    pending.attempts += 1;
+                    if pending.attempts < MAX_PUBLISH_ATTEMPTS {
+                        // Retry after the session reconnects.
+                        let _ = self
+                            .transfers_tx
+                            .send(TransferDone::Slack { pending, result });
+                    } else {
+                        self.in_flight.remove(&pending.key);
+                        warn!(event_id = %pending.event_id, %error, "gave up publishing Slack message with files");
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            }
+            TransferDone::Buzz { done, result } => {
+                self.in_flight.remove(&done.key);
+                match result {
+                    Ok(Some(ts)) => self.state.record_message_pair(
+                        done.buzz_channel_id,
+                        &done.buzz_event_id,
+                        SlackMessageRef {
+                            team_id: done.team_id,
+                            channel_id: done.channel_id,
+                            ts,
+                            thread_ts: done.thread_ts,
+                        },
+                    )?,
+                    Ok(None) => {
+                        info!(
+                            buzz_event_id = %done.buzz_event_id,
+                            "Slack did not report the share's ts; replies will fall back to channel level"
+                        );
+                        self.state
+                            .record_delivered_without_ts(&done.buzz_event_id)?;
+                    }
+                    Err(error) => {
+                        warn!(buzz_event_id = %done.buzz_event_id, %error, "Buzz message with files not delivered; a relay replay will retry it");
+                        return Ok(());
+                    }
+                }
+                info!(buzz_event_id = %done.buzz_event_id, "bridged Buzz message with files to Slack");
+                Ok(())
+            }
+        }
     }
 
     async fn slack_display_name(&mut self, user_id: &str) -> Result<String> {
@@ -897,7 +995,7 @@ fn compose_slack_origin_content(
     content
 }
 
-fn compose_buzz_comment(
+pub(crate) fn compose_buzz_comment(
     author: &str,
     fallback_label: &str,
     content: &str,
@@ -992,7 +1090,7 @@ fn abbreviated_pubkey(pubkey: &str) -> String {
     format!("{}…{}", &pubkey[..8], &pubkey[pubkey.len() - 6..])
 }
 
-fn escape_slack_label(input: &str) -> String {
+pub(crate) fn escape_slack_label(input: &str) -> String {
     input
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1006,7 +1104,7 @@ fn escape_slack_label(input: &str) -> String {
 /// Slack interprets angle-bracket control sequences as mentions and links.
 /// Escape Buzz-authored content before posting it into an externally shared
 /// channel so a string such as `<!channel>` cannot become a mass mention.
-fn escape_slack_message_body(input: &str) -> String {
+pub(crate) fn escape_slack_message_body(input: &str) -> String {
     input
         .replace('&', "&amp;")
         .replace('<', "&lt;")

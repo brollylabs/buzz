@@ -1544,6 +1544,7 @@ dependencies = [
  "buzz-sdk",
  "buzz-ws-client",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "hex",
  "hmac 0.13.0",
