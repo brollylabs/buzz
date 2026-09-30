@@ -20,8 +20,8 @@ use crate::{
     config::{ChannelMapping, Config},
     media::{parse_imeta, strip_media_markdown},
     slack::{
-        escape_markdown_label, slack_mrkdwn_to_markdown, slack_user_mentions, SlackClient,
-        SlackDelivery, SlackEvent, SlackFile, WebhookControl,
+        escape_markdown_label, slack_emoji_to_unicode, slack_mrkdwn_to_markdown,
+        slack_user_mentions, SlackClient, SlackDelivery, SlackEvent, SlackFile, WebhookControl,
     },
     state::{SlackMessageRef, StateStore},
     transfer::{copy_slack_files, deliver_buzz_message, BuzzDelivery, SlackCopyResult},
@@ -1011,7 +1011,7 @@ fn compose_slack_origin_content(
         "**{} · Slack**\n{}{}",
         escape_markdown_label(author),
         fallback_label,
-        slack_mrkdwn_to_markdown(text, mention_names)
+        slack_emoji_to_unicode(&slack_mrkdwn_to_markdown(text, mention_names))
     );
     for line in attachments {
         if !content.ends_with('\n') {
@@ -1243,6 +1243,20 @@ mod tests {
         assert_eq!(
             compose_slack_origin_content("ram", "", "<@U1> see PR", &[], &names),
             "**ram · Slack**\n@Jumair see PR"
+        );
+    }
+
+    #[test]
+    fn slack_origin_content_converts_emoji() {
+        assert_eq!(
+            compose_slack_origin_content(
+                "ram",
+                "",
+                ":white_check_mark: Mark Column K",
+                &[],
+                &HashMap::new()
+            ),
+            "**ram · Slack**\n✅ Mark Column K"
         );
     }
 

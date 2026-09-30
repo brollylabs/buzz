@@ -1,11 +1,13 @@
 //! Minimal Slack Events/Web API client for the bridge.
 
 mod api;
+mod emoji;
 mod webhook;
 
 use std::collections::HashMap;
 
 pub(crate) use api::{SlackClient, UploadFile};
+pub(crate) use emoji::slack_emoji_to_unicode;
 pub(crate) use webhook::{
     run_webhook_server, SlackDelivery, SlackEvent, SlackFile, WebhookControl, WebhookServerState,
 };
