@@ -14,6 +14,8 @@ oauth_config:
       - groups:history
       - groups:read
       - chat:write
+      - files:read
+      - files:write
       - users:read
 settings:
   event_subscriptions:

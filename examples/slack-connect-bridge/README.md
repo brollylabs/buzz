@@ -44,7 +44,9 @@ which channel pairs cross the organizational boundary.
 | Slack unshare/reshare | Route paused/resumed |
 | Slack webhook retries | Idempotent through durable timestamp ↔ event-ID mappings |
 | Buzz reconnect/replay | Bounded replay with durable deduplication |
-| Files, edits, deletes, reactions, DMs, huddles | Not in this focused reference slice |
+| Files and images (up to 100 MB, 10 per message) | Both directions; needs `files:read` and `files:write` (brollylabs fork) |
+| Mentions and emoji shortcodes | `@name` both directions; Slack `:shortcode:` → Unicode (brollylabs fork) |
+| Edits, deletes, reactions, DMs, huddles | Not in this focused reference slice |
 
 This is a live coexistence bridge, not a history importer. For workspace
 migration, see the separate Slack import work in
